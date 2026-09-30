@@ -226,12 +226,27 @@ def prelude(c, p, arch, item):
 
 
 def ready(c, p, arch, item, mode):
-    output = ssh(c, mode, prelude(c, p, arch, item) + '''
+    # Match the publication boundary used by install(), including the CLI bundle.
+    publish = item['target']
+    if c['layout'] == 'vscode-cli' and item['kind'] == 'server':
+        publish = posixpath.dirname(publish)
+    check = 'publish="$root"/%s\n' % shlex.quote(publish)
+    output = ssh(c, mode, prelude(c, p, arch, item) + check + '''
 command -v timeout >/dev/null || { echo 'Missing remote timeout utility'; exit 2; }
-if ready "$target"; then echo SSHUF_READY; else echo SSHUF_MISSING; fi
+if ready "$target"; then
+    echo SSHUF_READY
+elif [[ -e "$publish" || -L "$publish" ]]; then
+    echo SSHUF_INCOMPLETE
+else
+    echo SSHUF_MISSING
+fi
 ''', timeout=90)
     if 'SSHUF_READY' in output.splitlines():
         return True
+    if 'SSHUF_INCOMPLETE' in output.splitlines():
+        raise Failure('Incomplete target already exists for %s; inspect its directory and '
+                      'related processes before backing it up and moving it aside. '
+                      'Existing files are preserved.' % publish)
     if 'SSHUF_MISSING' in output.splitlines():
         return False
     raise Failure('Remote readiness check returned no marker')

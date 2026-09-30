@@ -14,6 +14,8 @@ description: 修复 Cursor 或 VS Code 更新后因远端 Server 下载、上传
 - 先保存拟修改设置项的原值。在本机用户设置中合并 `"remote.SSH.localServerDownload": "always"`，确认编辑器能够通过本机网络下载，再验证上传和连接。这个设置影响其他 SSH 主机；若已有冲突策略，说明影响后确定方案。
 - 原生流程成功则结束，不安装钩子。已有有效脚本也不重复替换。只有原生上传不兼容等问题才进入下一步。
 
+若日志显示本机下载完成、`Successfully SCP'd server`，但重试仍报告远端安装包不存在，不能仅凭上传日志判定成功。在某些平台的 SSH 命令入口中，`;`、`>`、`$HOME` 会原样出现在输出中，上传命令没有按 Shell 语法执行。用 Bash 标准输入执行只读命令并检查执行标记和远端文件；确认此类不兼容后再配置脚本，必要时使用 `--transport bash-stdin`。
+
 ## 2. 配置配套脚本
 
 先检查扩展支持 `remote.SSH.preconnect`，从日志确认安装模式、远端 Server 数据根目录。Cursor 对应 `cursor`；VS Code 的默认 CLI 模式对应 `vscode-cli`，旧版模式对应 `vscode-legacy`。不要为了匹配脚本修改 `useExecServer`。不识别的布局停止并说明。
@@ -43,13 +45,13 @@ python3 scripts/prepare_server.py configure \
 python3 scripts/prepare_server.py prepare --config /path/to/config.json --check-only
 ```
 
-退出码 0 表示远端已就绪，10 表示缺少版本，其他值表示错误。需要准备时去掉 `--check-only`。成功后，将输出的主机项合并到本机用户设置的 `remote.SSH.preconnect`。已有全局脚本或同名主机钩子时停止覆盖，解释冲突。首次执行的脚本信任确认由使用者完成。
+退出码 0 表示远端已就绪，10 表示目标不存在、需要安装，其他值表示错误（包括已有不完整目标）。需要准备时去掉 `--check-only`。成功后，将输出的主机项合并到本机用户设置的 `remote.SSH.preconnect`。已有全局脚本或同名主机钩子时停止覆盖，解释冲突。首次执行的脚本信任确认由使用者完成。
 
 ## 3. 行为与失败处理
 
 脚本在本机运行，通过 SSH 在远端执行命令；普通 SSH 登录不触发钩子。远端已就绪则不下载；缺版本先复用缓存，无缓存才从官方 HTTPS 地址下载。两种编辑器的包、版本及布局分别处理，VS Code CLI 模式同时准备 CLI 和 Server。
 
-安装先校验归档路径、构建标识和传输哈希，再检查远端程序并发布。已有不完整目标或其他安装锁会明确报错；先检查相关进程和目录，再决定是否备份移走，禁止自动删除整个 Server 目录或终止所有同名进程。失败后修复原因再重试，不无限循环。
+下载或上传前先检查现有目标；原生安装失败留下的空目录也属于不完整目标，会提前报错，避免上传后才发现冲突。先检查相关进程和目录，再决定是否备份移走，禁止自动删除整个 Server 目录或终止所有同名进程。安装还会校验归档路径、构建标识和传输哈希，检查远端程序，并在持锁发布时再次拒绝覆盖不完整目标。其他安装锁会明确报错。失败后修复原因再重试，不无限循环。
 
 本机配置旁的 `cache/` 保留安装包和校验记录，`prepare.log` 保留诊断日志；旧缓存不会自动清理。远端正常退出时清理临时包，保留已安装 Server。缓存损坏时成对移走对应安装包和元数据，再重试。无安装进行时可按需删除旧缓存。
 
@@ -61,6 +63,6 @@ python3 scripts/prepare_server.py prepare --config /path/to/config.json --check-
 - 完成后简述所用方案、改动项、缓存位置和实测结果。区分真实连接、脚本检查和模拟测试；未测试的平台明确写“未实测”。
 - 回退内置方案时恢复该设置项原值；回退钩子时只恢复或删除对应主机项。不得整份覆盖后续修改的设置。确认钩子不再引用后，可删除本次独立运行目录，远端可用 Server 保留。
 - 安装本 Skill 只提供流程与脚本，仍需首次调用并配置目标主机。运行时无需再次调用 AI。不要承诺未来产品安装协议变化仍自动兼容。
-- 分享前确认文件夹仅含 `SKILL.md` 和 `scripts/prepare_server.py`，清理 `.DS_Store`、缓存等额外文件。
+- 分发 Skill 时仅打包 `SKILL.md` 和 `scripts/prepare_server.py`；仓库中的 `tests/` 用于开发验证，不是运行依赖。清理 `.DS_Store`、缓存等额外文件。
 
 依据：[VS Code 下载策略](https://code.visualstudio.com/docs/remote/ssh)、[连接前脚本](https://github.com/microsoft/vscode-docs/blob/main/remote-release-notes/v1_101.md#pre-connection-script)。
