@@ -63,8 +63,10 @@ def run(argv, data=None, stream=None, timeout=60):
     try:
         out, err = ACTIVE.communicate(data, timeout=timeout)
         if ACTIVE.returncode:
-            raise Failure('Command failed (%s): %s' %
-                          (Path(argv[0]).name, (err + out).decode('utf-8', 'replace')[-1600:]))
+            detail = '\n'.join(label + ': ' + value.decode('utf-8', 'replace')[-1600:]
+                               for label, value in (('stderr', err), ('stdout', out)) if value)
+            raise Failure('Command failed (%s, exit %s): %s' %
+                          (Path(argv[0]).name, ACTIVE.returncode, detail))
         return out.decode('utf-8', 'replace')
     except subprocess.TimeoutExpired:
         stop()
@@ -158,6 +160,10 @@ def configure(args):
     hook.chmod(0o700)
     print(json.dumps({'remote.SSH.preconnect': {c['host']: str(hook)}}, indent=2))
     print('Merge this host entry into LOCAL user settings; do not replace existing entries.')
+    print('Remote Server data directory: ' + c['remote_root'] +
+          ('' if c['remote_root'].startswith('/') else ' (relative to remote HOME)'))
+    print('Match remote.SSH.serverInstallPath for this host to this directory using the installed '
+          'extension and connection log; some installers append the product directory name.')
     print('Runtime configuration, cache and log directory: ' + str(state))
 
 
@@ -200,14 +206,17 @@ def artifacts(c, p, arch):
     return result
 
 
-def prelude(c, p, arch, item):
+def remote_root_expression(c):
     root = c['remote_root']
-    root_expr = shlex.quote(root) if root.startswith('/') else '"$HOME"/' + shlex.quote(root)
+    return shlex.quote(root) if root.startswith('/') else '"$HOME"/' + shlex.quote(root)
+
+
+def prelude(c, p, arch, item):
     entry = 'cursor-server' if c['editor'] == 'cursor' else 'code-server'
     script = 'set -euo pipefail\numask 077\nunset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY\n'
     script += '[[ "$(uname -s)/$(uname -m)" = %s ]] || exit 2\n' % shlex.quote('Linux/' + ('aarch64' if arch == 'arm64' else 'x86_64'))
     script += 'root=%s\ntarget="$root"/%s\ncommit=%s\ndownload=%s\nentry=%s\n' % (
-        root_expr, shlex.quote(item['target']), shlex.quote(p['commit']), shlex.quote(p['download']), shlex.quote(entry))
+        remote_root_expression(c), shlex.quote(item['target']), shlex.quote(p['commit']), shlex.quote(p['download']), shlex.quote(entry))
     if item['kind'] == 'cli':
         script += '''ready() {
     [[ -x "$1" ]] || return 1
@@ -335,6 +344,56 @@ def get_archive(c, p, arch, item, cache):
     return path, actual, info
 
 
+def required_space_kb(packages):
+    # Keep all published components, plus the largest package and its heredoc.
+    unpacked = 0
+    largest_upload = 0
+    for path, _checksum, info in packages:
+        size = path.stat().st_size
+        encoded = 4 * ((size + 2) // 3) + (size + 56) // 57
+        unpacked += info['unpacked']
+        largest_upload = max(largest_upload, size + encoded)
+    return (unpacked + largest_upload + 256 * 1024**2 + 1023) // 1024
+
+
+def space_check_script(needed_kb):
+    return 'needed_kb=%d\n' % needed_kb + r'''
+check_dir="$root"
+available_kb=unknown
+space_fail() {
+    printf 'Space check failed: %s; root=%s; checked=%s; available_kib=%s; required_kib=%s. Choose a writable directory with enough space; no automatic cleanup or HOME fallback.\n' \
+        "$1" "$root" "$check_dir" "$available_kb" "$needed_kb" >&2
+    exit 4
+}
+while [[ ! -e "$check_dir" ]]; do
+    [[ ! -L "$check_dir" ]] || space_fail 'Dangling directory symlink'
+    parent=$(dirname -- "$check_dir")
+    [[ "$parent" != "$check_dir" ]] || space_fail 'No existing parent directory'
+    check_dir="$parent"
+done
+[[ -d "$check_dir" && -w "$check_dir" && -x "$check_dir" ]] || space_fail 'Directory is not writable/searchable'
+df_output=$(LC_ALL=C df -Pk "$check_dir") || space_fail "df failed (exit $?)"
+available_kb=$(printf '%s\n' "$df_output" | awk 'END {print $4}')
+[[ "$available_kb" =~ ^[0-9]{1,18}$ ]] || space_fail 'Invalid free-space value from df'
+available_kb=$((10#$available_kb))
+[[ "$available_kb" -ge "$needed_kb" ]] || space_fail 'Insufficient disk space'
+printf 'SPACE root=%s; checked=%s; available_kib=%s; required_kib=%s\n' \
+    "$root" "$check_dir" "$available_kb" "$needed_kb"
+'''
+
+
+def check_space(c, mode, packages):
+    # A short, read-only request surfaces errors before sending the large stdin stream.
+    script = 'set -euo pipefail\nroot=%s\n' % remote_root_expression(c)
+    script += space_check_script(required_space_kb(packages)) + 'echo SSHUF_SPACE_OK\n'
+    output = ssh(c, mode, script)
+    if 'SSHUF_SPACE_OK' not in output.splitlines():
+        raise Failure('Remote space check returned no marker')
+    for line in output.splitlines():
+        if line.startswith('SPACE '):
+            log(line)
+
+
 def install(c, p, arch, item, mode, path, checksum, info):
     # Stage on the destination filesystem. Never replace an existing incomplete target.
     head = prelude(c, p, arch, item) + '''
@@ -361,8 +420,8 @@ lock_hash=$(printf '%s\\n' "$root" | md5sum | awk '{print $1}')
 lock_parent="${XDG_RUNTIME_DIR:-/tmp}"
 [[ -d "$lock_parent" && -w "$lock_parent" ]] || lock_parent=/tmp
 native_lock="$lock_parent/cursor-remote-lock.$lock_hash"
-native_target=$(mktemp "$native_lock.target.sshuf.XXXXXXXX")
-printf 'owner_pid=%s\\nheartbeat=%s\\nnonce=sshuf-%s\\n' "$$" "$(date +%s)" "$$" > "$native_target"
+native_target=$(mktemp "$native_lock.target.sshuf.XXXXXXXX") || { echo "Cannot create Cursor install lock in $lock_parent; check its permissions and free space" >&2; exit 3; }
+printf 'owner_pid=%s\\nheartbeat=%s\\nnonce=sshuf-%s\\n' "$$" "$(date +%s)" "$$" > "$native_target" || { echo "Cannot write Cursor install lock in $lock_parent; check its permissions and free space" >&2; exit 3; }
 ln "$native_target" "$native_lock" 2>/dev/null || { echo 'Cursor install lock exists; finish or cancel the other installation'; exit 3; }
 '''
     elif c['layout'] == 'vscode-cli' and item['kind'] == 'server':
@@ -371,9 +430,10 @@ mkdir -p "$root/cli/servers/.locks"
 exec 8>"$root/cli/servers/.locks/Stable-$commit"
 flock -w 120 8 || { echo 'VS Code Server installation is busy'; exit 3; }
 '''
-    needed = (path.stat().st_size + info['unpacked'] + 256 * 1024**2) // 1024
-    head += '[[ $(df -Pk "$root" | awk \'END {print $4}\') -ge %d ]] || { echo "Insufficient disk space"; exit 4; }\n' % needed
+    head += space_check_script(required_space_kb([(path, checksum, info)]))
     head += '''stage=$(mktemp -d "$root/.sshuf-stage.XXXXXXXX")
+mkdir -m 700 "$stage/tmp"
+export TMPDIR="$stage/tmp"
 base64 -d > "$stage/archive.tar.gz" <<'SSHUF_ARCHIVE_END'
 '''
     tail = "SSHUF_ARCHIVE_END\n[[ $(sha256sum \"$stage/archive.tar.gz\" | awk '{print $1}') = %s ]] || { echo 'Upload checksum mismatch'; exit 5; }\n" % shlex.quote(checksum)
@@ -436,6 +496,7 @@ def prepare(args):
             return 10
         # Validate every archive before publishing any component.
         packages = [(item, get_archive(c, p, arch, item, cache)) for item in missing]
+        check_space(c, mode, [package for _item, package in packages])
         for item, package in packages:
             install(c, p, arch, item, mode, *package)
         if not all(ready(c, p, arch, item, mode) for item in items):
