@@ -24,6 +24,15 @@ class Failure(Exception):
     pass
 
 
+class CommandFailure(Failure):
+    def __init__(self, command, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stderr = stderr.decode('utf-8', 'replace')
+        streams = (('stderr', self.stderr), ('stdout', stdout.decode('utf-8', 'replace')))
+        detail = '\n'.join(label + ': ' + value[-1600:] for label, value in streams if value)
+        super().__init__('Command failed (%s, exit %s): %s' % (command, returncode, detail))
+
+
 ACTIVE = None
 LOG = None
 
@@ -63,10 +72,7 @@ def run(argv, data=None, stream=None, timeout=60):
     try:
         out, err = ACTIVE.communicate(data, timeout=timeout)
         if ACTIVE.returncode:
-            detail = '\n'.join(label + ': ' + value.decode('utf-8', 'replace')[-1600:]
-                               for label, value in (('stderr', err), ('stdout', out)) if value)
-            raise Failure('Command failed (%s, exit %s): %s' %
-                          (Path(argv[0]).name, ACTIVE.returncode, detail))
+            raise CommandFailure(Path(argv[0]).name, ACTIVE.returncode, out, err)
         return out.decode('utf-8', 'replace')
     except subprocess.TimeoutExpired:
         stop()
@@ -168,12 +174,27 @@ def configure(args):
 
 
 def ssh(c, mode, script=None, stream=None, timeout=60):
+    host = c['host']
     command = ['bash -s'] if mode == 'normal' else ['bash', '--login', '-c', 'bash']
-    return run(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15',
-                '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
-                '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no',
-                c['host']] + command,
-               data=script.encode() if script is not None else None, stream=stream, timeout=timeout)
+    argv = ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15',
+            '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+            '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no', host] + command
+    try:
+        return run(argv, data=script.encode() if script is not None else None,
+                   stream=stream, timeout=timeout)
+    except CommandFailure as exc:
+        if exc.returncode != 255:
+            raise
+        if 'REMOTE HOST IDENTIFICATION HAS CHANGED!' in exc.stderr:
+            hint = ('SSH host key changed for %s. Confirm the key rotation and new fingerprint '
+                    'with the platform or administrator before updating the matching known_hosts entry.' % host)
+        elif 'Host key verification failed.' in exc.stderr.splitlines():
+            hint = ('SSH host key verification failed for %s. For a new host or port, verify the '
+                    'fingerprint with the platform or administrator. Run "ssh %s" in a local '
+                    'terminal and accept the first-use prompt only if the fingerprint matches.' % (host, host))
+        else:
+            raise
+        raise Failure(hint + '\n' + str(exc)) from exc
 
 
 def probe(c):

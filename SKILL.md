@@ -11,6 +11,7 @@ description: 修复 Cursor 或 VS Code 更新后因远端 Server 下载、上传
 
 - 检查当前运行的编辑器、Remote-SSH 扩展、现有本机用户设置和一次失败日志。Cursor 使用 `anysphere.remote-ssh`，VS Code 使用 `ms-vscode-remote.remote-ssh`。
 - 复用使用者的 SSH 别名；只检查目标主机，不收集其他主机或读取私钥。确认远端为 Linux x64/ARM64，检查用户目录及工具。需要自动准备时，SSH 密钥或 ssh-agent 应支持非交互连接。
+- 遇到 `Host key verification failed` 时，先通过平台或管理员核对主机指纹。新地址或端口首次连接时，用同一个别名在本机终端执行 SSH，指纹一致后才确认。若明确报 `REMOTE HOST IDENTIFICATION HAS CHANGED`，先核实换钥，再处理对应的 `known_hosts` 条目。保留 SSH 主机身份校验。
 - 首次配置先确定安装盘：检查 HOME 和使用者指定工作目录的写入权限、所属磁盘及剩余空间。有个人工作盘时优先使用，不自动挑选共享目录；目标不存在时检查最近的现有父目录。空间不足时先确定其他安装位置。
 - 先保存拟修改设置项的原值。在本机用户设置中合并 `"remote.SSH.localServerDownload": "always"`，确认编辑器能够通过本机网络下载，再验证上传和连接。这个设置影响其他 SSH 主机；若已有冲突策略，说明影响后确定方案。
 - 原生流程成功则结束，不安装钩子。已有有效脚本也不重复替换。只有原生上传不兼容等问题才进入下一步。

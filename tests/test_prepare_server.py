@@ -385,6 +385,38 @@ class CommandFailureTests(unittest.TestCase):
         for value in ('4', 'diagnostic-out', 'diagnostic-err'):
             self.assertIn(value, str(error.exception))
 
+    def ssh_error(self, stderr):
+        with patch.object(helper.subprocess, 'Popen') as popen:
+            popen.return_value.returncode = 255
+            popen.return_value.communicate.return_value = (b'', stderr.encode())
+            with self.assertRaises(helper.Failure) as error:
+                helper.probe({'host': 'test-host', 'transport': 'auto'})
+        popen.assert_called_once()
+        self.assertIn('BatchMode=yes', popen.call_args.args[0])
+        return str(error.exception)
+
+    def test_host_key_verification_failure_guides_first_use_confirmation(self):
+        for detail in ('', 'No RSA host key is known for [test-host]:2222.\n'):
+            with self.subTest(detail=detail):
+                error = self.ssh_error(detail + 'Host key verification failed.\n')
+                self.assertIn('ssh test-host', error)
+                self.assertIn('only if the fingerprint matches', error)
+                self.assertIn('exit 255', error)
+                self.assertIn('Host key verification failed.', error)
+
+    def test_changed_host_key_requires_rotation_check_even_after_a_long_log(self):
+        stderr = ('@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @\n'
+                  + 'Other SSH diagnostics\n' * 100 + 'Host key verification failed.\n')
+        error = self.ssh_error(stderr)
+        self.assertIn('Confirm the key rotation', error)
+        self.assertIn('known_hosts', error)
+        self.assertNotIn('accept the first-use prompt', error)
+
+    def test_unrelated_ssh_failures_keep_their_original_diagnostic(self):
+        for detail in ('Permission denied (publickey).', 'Connection refused'):
+            with self.subTest(detail=detail):
+                self.assertEqual(self.ssh_error(detail), 'Command failed (ssh, exit 255): stderr: ' + detail)
+
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Actual heredoc temp files require Linux /proc and GNU tools')
 class LinuxUploadTests(RemoteFixture):
